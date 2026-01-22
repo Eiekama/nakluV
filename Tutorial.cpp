@@ -1,20 +1,93 @@
 #include "Tutorial.hpp"
 
+#include "Helpers.hpp"
+#include "PosColVertex.hpp"
 #include "VK.hpp"
+#include "mat4.hpp"
 #include "refsol.hpp"
+#include "vulkan/vulkan_core.h"
 
+#include <__config>
+#include <_types/_uint32_t.h>
+#include <_types/_uint8_t.h>
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 Tutorial::Tutorial(RTG &rtg_) : rtg(rtg_) {
 	refsol::Tutorial_constructor(rtg, &depth_format, &render_pass, &command_pool);
 
+	background_pipeline.create(rtg, render_pass, 0);
+	lines_pipeline.create(rtg, render_pass, 0);
+
+	{ // create descriptor pool
+		uint32_t per_workspace = uint32_t(rtg.workspaces.size()); //for easier-to-read counting
+		std::array<VkDescriptorPoolSize, 1> pool_sizes{
+			VkDescriptorPoolSize{
+				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.descriptorCount = 1 * per_workspace, //one descriptor per set, one set per workspace
+			}
+		};
+		VkDescriptorPoolCreateInfo create_info{
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+			.flags = 0, //because CREATE_FREE_DESCRIPTOR_SET_BIT isn't included, *can't* free individual descriptors allocated from this pool
+			.maxSets = 1 * per_workspace,
+			.poolSizeCount = uint32_t(pool_sizes.size()),
+			.pPoolSizes = pool_sizes.data(),
+		};
+		VK( vkCreateDescriptorPool(rtg_.device, &create_info, nullptr, &descriptor_pool) );
+	}
+
 	workspaces.resize(rtg.workspaces.size());
 	for (Workspace &workspace : workspaces) {
 		refsol::Tutorial_constructor_workspace(rtg, command_pool, &workspace.command_buffer);
+
+		workspace.Camera_src = rtg.helpers.create_buffer(
+			sizeof(LinesPipeline::Camera), 
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			Helpers::Mapped
+		);
+		workspace.Camera = rtg.helpers.create_buffer(
+			sizeof(LinesPipeline::Camera), 
+			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			Helpers::Unmapped
+		);
+
+		{ // allocate descriptor set for Camera descriptor
+			VkDescriptorSetAllocateInfo alloc_info{
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+				.descriptorPool = descriptor_pool,
+				.descriptorSetCount = 1,
+				.pSetLayouts = &lines_pipeline.set0_Camera,
+			};
+			VK( vkAllocateDescriptorSets(rtg.device, &alloc_info, &workspace.Camera_descriptors) );
+		}
+
+		{ // point descriptor to Camera buffer
+			VkDescriptorBufferInfo Camera_info{
+				.buffer = workspace.Camera.handle,
+				.offset = 0,
+				.range = workspace.Camera.size,
+			};
+			std::array<VkWriteDescriptorSet, 1> writes{
+				VkWriteDescriptorSet{
+					.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+					.dstSet = workspace.Camera_descriptors,
+					.dstBinding = 0,
+					.dstArrayElement = 0,
+					.descriptorCount = 1,
+					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+					.pBufferInfo = &Camera_info,
+				},
+			};
+			vkUpdateDescriptorSets(rtg.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+		}
 	}
 }
 
@@ -31,8 +104,31 @@ Tutorial::~Tutorial() {
 
 	for (Workspace &workspace : workspaces) {
 		refsol::Tutorial_destructor_workspace(rtg, command_pool, &workspace.command_buffer);
+
+		if (workspace.lines_vertices_src.handle != VK_NULL_HANDLE) {
+			rtg.helpers.destroy_buffer(std::move(workspace.lines_vertices_src));
+		}
+		if (workspace.lines_vertices.handle != VK_NULL_HANDLE) {
+			rtg.helpers.destroy_buffer(std::move(workspace.lines_vertices));
+		}
+
+		if (workspace.Camera_src.handle != VK_NULL_HANDLE) {
+			rtg.helpers.destroy_buffer(std::move(workspace.Camera_src));
+		}
+		if (workspace.Camera.handle != VK_NULL_HANDLE) {
+			rtg.helpers.destroy_buffer(std::move(workspace.Camera));
+		}
 	}
 	workspaces.clear();
+
+	if (descriptor_pool) {
+		vkDestroyDescriptorPool(rtg.device, descriptor_pool, nullptr);
+		descriptor_pool = nullptr;
+		//(this also frees the descriptor sets allocated from the pool)
+	}
+
+	lines_pipeline.destroy(rtg);
+	background_pipeline.destroy(rtg);
 
 	refsol::Tutorial_destructor(rtg, &render_pass, &command_pool);
 }
@@ -57,15 +153,275 @@ void Tutorial::render(RTG &rtg_, RTG::RenderParams const &render_params) {
 	Workspace &workspace = workspaces[render_params.workspace_index];
 	VkFramebuffer framebuffer = swapchain_framebuffers[render_params.image_index];
 
-	//record (into `workspace.command_buffer`) commands that run a `render_pass` that just clears `framebuffer`:
-	refsol::Tutorial_render_record_blank_frame(rtg, render_pass, framebuffer, &workspace.command_buffer);
+	// - set up command buffer -------------------------------------------------
+	VK( vkResetCommandBuffer(workspace.command_buffer, 0) );
+	{ // begin recording
+		VkCommandBufferBeginInfo begin_info{
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+			.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+		};
+		VK( vkBeginCommandBuffer(workspace.command_buffer, &begin_info) );
+	}
+
+	if (!lines_vertices.empty()) { // upload lines vertices
+		// (re)allocate lines buffers if needed
+		size_t needed_bytes = lines_vertices.size() * sizeof(lines_vertices[0]);
+		if (workspace.lines_vertices_src.handle == VK_NULL_HANDLE || workspace.lines_vertices_src.size < needed_bytes) {
+			size_t new_bytes = ((needed_bytes + 4096) / 4096) * 4096;
+
+			if (workspace.lines_vertices_src.handle) { // seems a bit sus but we follow the writeup for now
+				rtg.helpers.destroy_buffer(std::move(workspace.lines_vertices_src));
+			}
+			if (workspace.lines_vertices.handle) {
+				rtg.helpers.destroy_buffer(std::move(workspace.lines_vertices));
+			}
+
+			workspace.lines_vertices_src = rtg.helpers.create_buffer(
+				new_bytes,
+				VK_BUFFER_USAGE_TRANSFER_SRC_BIT, // going to have GPU copy from this memory
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, // host-visible memory, coherent (no special sync necessary)
+				Helpers::Mapped // get a pointer to the memory
+			);
+			workspace.lines_vertices = rtg.helpers.create_buffer(
+				new_bytes,
+				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, // going to use as vertex buffer, also going to have GPU into this memory
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, // GPU-local memory
+				Helpers::Unmapped // don't get a pointer to the memory
+			);
+
+			std::cout << "Re-allocated lines buffers to " << new_bytes << " bytes." << std::endl;
+		}
+
+		assert(workspace.lines_vertices_src.size == workspace.lines_vertices.size);
+		assert(workspace.lines_vertices_src.size >= needed_bytes);
+
+		//host-side copy into lines_vertices_src:
+		assert(workspace.lines_vertices_src.allocation.mapped);
+		memcpy(workspace.lines_vertices_src.allocation.data(), lines_vertices.data(), needed_bytes);
+
+		//device-side copy from lines_vertices_src -> lines_vertices:
+		VkBufferCopy copy_region{
+			.srcOffset = 0,
+			.dstOffset = 0,
+			.size = needed_bytes,
+		};
+		vkCmdCopyBuffer(workspace.command_buffer, workspace.lines_vertices_src.handle, workspace.lines_vertices.handle, 1, &copy_region);
+	}
+	{ // upload camera info
+		LinesPipeline::Camera camera{
+			.CLIP_FROM_WORLD = CLIP_FROM_WORLD,
+		};
+		assert(workspace.Camera_src.size == sizeof(camera));
+		memcpy(workspace.Camera_src.allocation.data(), &camera, sizeof(camera));
+
+		assert(workspace.Camera.size == workspace.Camera_src.size);
+		VkBufferCopy copy_region{
+			.srcOffset = 0,
+			.dstOffset = 0,
+			.size = workspace.Camera_src.size,
+		};
+		vkCmdCopyBuffer(workspace.command_buffer, workspace.Camera_src.handle, workspace.Camera.handle, 1, &copy_region);
+	}
+
+	{ // memory barrier to make sure copies complete before rendering happens:
+		VkMemoryBarrier memory_barrier{
+			.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+		};
+		vkCmdPipelineBarrier(workspace.command_buffer, 
+			VK_PIPELINE_STAGE_TRANSFER_BIT, 
+			VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+			0,
+			1, &memory_barrier,
+			0, nullptr,
+			0, nullptr
+		);
+	}
+
+	{ // render pass
+		std::array<VkClearValue, 2> clear_values{
+			VkClearValue{ .color = { .float32{0.0f, 0.0f, 0.0f, 1.0f} } }, // set default color
+			VkClearValue{ .depthStencil{ .depth = 1.0f, .stencil = 0 } }
+		};
+		VkRenderPassBeginInfo begin_info{
+			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+			.renderPass = render_pass,
+			.framebuffer = framebuffer,
+			.renderArea{
+				.offset = { .x = 0, .y = 0 },
+				.extent = rtg.swapchain_extent,
+			},
+			.clearValueCount = uint32_t(clear_values.size()),
+			.pClearValues = clear_values.data(),
+		};
+		vkCmdBeginRenderPass(workspace.command_buffer, &begin_info, VK_SUBPASS_CONTENTS_INLINE);
+
+		{ // set scissor rectangle
+			VkRect2D scissor{
+				.offset = { .x = 0, .y = 0 },
+				.extent = rtg.swapchain_extent,
+			};
+			vkCmdSetScissor(workspace.command_buffer, 0, 1, &scissor);
+		}
+		{ // configure viewport transform
+			VkViewport viewport{
+				.x = 0.0f,
+				.y = 0.0f,
+				.width = float(rtg.swapchain_extent.width),
+				.height = float(rtg.swapchain_extent.height),
+				.minDepth = 0.0f,
+				.maxDepth = 1.0f,
+			};
+			vkCmdSetViewport(workspace.command_buffer, 0, 1, &viewport);
+		}
+		{ // draw with the background pipeline
+			// vkCmdBindPipeline(workspace.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, background_pipeline.handle);
+			// { // push constants
+			// 	BackgroundPipeline::Push push{
+			// 		.time = time,
+			// 	};
+			// 	vkCmdPushConstants(workspace.command_buffer, background_pipeline.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+			// }
+			// vkCmdDraw(workspace.command_buffer, 3, 1, 0, 0);
+		}
+		{ // draw with the lines pipeline
+			vkCmdBindPipeline(workspace.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, lines_pipeline.handle);
+			{ //use lines_vertices (offset 0) as vertex buffer binding 0:
+				std::array<VkBuffer, 1> vertex_buffers{ workspace.lines_vertices.handle };
+				std::array<VkDeviceSize, 1> offsets{ 0 };
+				vkCmdBindVertexBuffers(workspace.command_buffer, 0, uint32_t(vertex_buffers.size()), vertex_buffers.data(), offsets.data());
+			}
+			{ // bind Camera descriptor set
+				std::array<VkDescriptorSet, 1> descriptor_sets{
+					workspace.Camera_descriptors,
+				};
+				vkCmdBindDescriptorSets(
+					workspace.command_buffer, 
+					VK_PIPELINE_BIND_POINT_GRAPHICS, 
+					lines_pipeline.layout, 
+					0, 
+					uint32_t(descriptor_sets.size()), descriptor_sets.data(), 
+					0, nullptr
+				);
+			}
+			vkCmdDraw(workspace.command_buffer, uint32_t(lines_vertices.size()), 1, 0, 0);
+		}
+		
+		vkCmdEndRenderPass(workspace.command_buffer);
+	}
+
+	VK( vkEndCommandBuffer(workspace.command_buffer) ); // end recording command buffer
+	// -------------------------------------------------------------------------
 
 	//submit `workspace.command buffer` for the GPU to run:
 	refsol::Tutorial_render_submit(rtg, render_params, workspace.command_buffer);
 }
 
-
 void Tutorial::update(float dt) {
+	time = std::fmod(time + dt, 60.0f);
+
+	{ // camera orbiting the origin
+		float ang = 2.0f*float(M_PI) * 10.0f*(time/60.0f); // complete one revolution in 6 seconds
+		CLIP_FROM_WORLD = perspective(
+			60.0f * M_PI/180.0f, 
+			rtg.swapchain_extent.width / float(rtg.swapchain_extent.height), 
+			0.1f,
+			1000.0f
+		) * look_at(
+			3.0f * std::cos(ang), 3.0f * std::sin(ang), 0.0f,
+			0.0f, 0.0f, 0.0f,
+			0.0f, 0.0f, 1.0f
+		);
+	}
+
+	{ // make some lines
+		lines_vertices.clear();
+		constexpr size_t count = 2*51 * 4;
+		lines_vertices.reserve(count);
+		for (uint32_t i = 0; i <= 50; ++i) {
+			float t1 = (i / 25.0f) - 1.0f;
+			float t2 = i / 50.0f;
+			float mt2 = 1.0f - t2;
+			uint8_t base = 0x00;
+			uint8_t c = uint8_t(float(base) + t2 * (255.0f - float(base)));
+			[[maybe_unused]] uint8_t mc = uint8_t(float(base) + mt2 * (255.0f - float(base)));
+			{
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=-1.0f, .y=t1, .z=t2 },
+					.Color{ .r=mc, .g=mc, .b=mc, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=1.0f, .z=1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=-1.0f, .y=-t1, .z=1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=-1.0f, .z=mt2 },
+					.Color{ .r=c, .g=c, .b=c, .a=0xff }
+				});
+
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=1.0f, .y=t1, .z=mt2 },
+					.Color{ .r=c, .g=c, .b=c, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=-1.0f, .z=1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=1.0f, .y=-t1, .z=1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=1.0f, .z=t2 },
+					.Color{ .r=mc, .g=mc, .b=mc, .a=0xff }
+				});
+			}
+			{
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=-1.0f, .y=t1, .z=-1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=1.0f, .z=-mt2 },
+					.Color{ .r=c, .g=c, .b=c, .a=0xff }
+				});
+
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=-1.0f, .y=-t1, .z=-t2 },
+					.Color{ .r=mc, .g=mc, .b=mc, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=-1.0f, .z=-1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=1.0f, .y=t1, .z=-1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=-1.0f, .z=-t2 },
+					.Color{ .r=mc, .g=mc, .b=mc, .a=0xff }
+				});
+
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x=1.0f, .y=-t1, .z=-mt2 },
+					.Color{ .r=c, .g=c, .b=c, .a=0xff }
+				});
+				lines_vertices.emplace_back( PosColVertex{
+					.Position{ .x = t1, .y=1.0f, .z=-1.0f },
+					.Color{ .r=base, .g=base, .b=base, .a=0xff }
+				});
+			}
+		}
+	}
 }
 
 

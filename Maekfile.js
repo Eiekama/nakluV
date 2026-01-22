@@ -28,6 +28,7 @@ custom_flags_and_rules();
 // it returns the path to the output object file
 const main_objs = [
 	maek.CPP('Tutorial.cpp'),
+	maek.CPP('PosColVertex.cpp'),
 	maek.CPP('RTG.cpp'),
 	maek.CPP('Helpers.cpp'),
 	maek.CPP('main.cpp'),
@@ -37,18 +38,18 @@ const main_objs = [
 // it returns the path to the output .inl file
 
 //uncomment to build background shaders and pipeline:
-//const background_shaders = [
-//	maek.GLSLC('background.vert'),
-//	maek.GLSLC('background.frag'),
-//];
-//main_objs.push( maek.CPP('Tutorial-BackgroundPipeline.cpp', undefined, { depends:[...background_shaders] } ) );
+const background_shaders = [
+	maek.GLSLC('background.vert'),
+	maek.GLSLC('background.frag'),
+];
+main_objs.push( maek.CPP('Tutorial-BackgroundPipeline.cpp', undefined, { depends:[...background_shaders] } ) );
 
 //uncomment to build lines shaders and pipeline:
-//const lines_shaders = [
-//	maek.GLSLC('lines.vert'),
-//	maek.GLSLC('lines.frag'),
-//];
-//main_objs.push( maek.CPP('Tutorial-LinesPipeline.cpp', undefined, { depends:[...lines_shaders] } ) );
+const lines_shaders = [
+	maek.GLSLC('lines.vert'),
+	maek.GLSLC('lines.frag'),
+];
+main_objs.push( maek.CPP('Tutorial-LinesPipeline.cpp', undefined, { depends:[...lines_shaders] } ) );
 
 //uncomment to build objects shaders and pipeline:
 //const objects_shaders = [
