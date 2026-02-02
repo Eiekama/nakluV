@@ -6,11 +6,7 @@
 #include "mat4.hpp"
 #include "vulkan/vulkan_core.h"
 
-#if defined(__linux__)
-#include <GLFW/glfw.h>
-#else
 #include <GLFW/glfw3.h>
-#endif
 
 #include <array>
 #include <cassert>
@@ -1129,7 +1125,7 @@ void Tutorial::update(float dt) {
 	{ //static sun and sky:
 		[[maybe_unused]] float ang = 2.0f*float(M_PI) * 10.0f*(time/60.0f);
 
-		float _;
+		double _;
 		float hue = modf(10.0f*(time/60.0f), &_) * 360.0f;
 		float h = hue / 60.0f;
 		float c = 1.0f;

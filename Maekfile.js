@@ -90,7 +90,7 @@ function custom_flags_and_rules() {
 			`-lvulkan`,
 			`-L${GLFW_DIR}/lib`,
 			'-lX11',
-			`-lglfw3`,
+			`-lglfw`,
 		];
 
 	} else if (maek.OS === 'windows') {

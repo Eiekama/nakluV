@@ -9,11 +9,7 @@
 #endif
 #include <vulkan/vk_enum_string_helper.h> //useful for debug output
 
-#if defined(__linux__)
-#include <GLFW/glfw.h>
-#else
 #include <GLFW/glfw3.h>
-#endif
 
 #include <cassert>
 #include <chrono>
@@ -303,7 +299,7 @@ RTG::RTG(Configuration const &configuration_) : helpers(*this) {
 				uint32_t i = uint32_t(&queue_family - &queue_families[0]);
 
 				//if it does graphics, set the graphics queue family:
-				if (queue_family.queueFlags * VK_QUEUE_GRAPHICS_BIT) {
+				if (queue_family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
 					if (!graphics_queue_family) graphics_queue_family = i;
 				}
 

@@ -1,12 +1,9 @@
 #pragma once
 
-#include <__config>
-#include <_types/_uint32_t.h>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <sys/types.h>
 
 // NOTE: column-major storage order
 using mat4 = std::array<float, 16>;
