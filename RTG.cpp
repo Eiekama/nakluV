@@ -625,7 +625,14 @@ void RTG::recreate_swapchain() {
 		VkSurfaceCapabilitiesKHR capabilities;
 		VK( vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities) );
 
+#if defined(__linux__)
+		// only need to initialize swapchain_extent, then it's set outside this function
+		if (swapchain_extent.width == 0 || swapchain_extent.height == 0) {
+			swapchain_extent = configuration.surface_extent;
+		}
+#else
 		swapchain_extent = capabilities.currentExtent;
+#endif
 
 		uint32_t requested_count = capabilities.minImageCount + 1;
 		if (capabilities.maxImageCount != 0) {
@@ -849,6 +856,10 @@ static void key_callback(GLFWwindow *window, int key, int scancode, int action, 
 void RTG::run(Application &application) {
 	using clock = std::chrono::high_resolution_clock;
 
+#if defined(__linux__)
+	int width = 0, height = 0;
+#endif
+
 	auto on_swapchain = [&, this]() {
 		application.on_swapchain(*this, SwapchainEvent{
 			.extent = swapchain_extent,
@@ -978,7 +989,19 @@ void RTG::run(Application &application) {
 			VK( vkQueueSubmit(graphics_queue, 1, &submit_info, nullptr) );
 
 		} else {
-			retry:
+#if defined(__linux__)
+			//check for window resize manually since the vulkan functions on Wayland doesn't seem to work quite right
+			glfwGetFramebufferSize(window, &width, &height);
+			if ((uint32_t)width != swapchain_extent.width || (uint32_t)height != swapchain_extent.height) {
+				swapchain_extent.width = width;
+				swapchain_extent.height = height;
+				recreate_swapchain();
+				on_swapchain();
+			}
+			//Ask the swapchain for the next image index:
+			vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, workspaces[workspace_index].image_available, VK_NULL_HANDLE, &image_index);
+#else
+retry:
 			//Ask the swapchain for the next image index -- note careful return handling:
 			if (VkResult result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, workspaces[workspace_index].image_available, VK_NULL_HANDLE, &image_index);
 				result == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -996,6 +1019,7 @@ void RTG::run(Application &application) {
 				//other non-success results are genuine errors:
 				throw std::runtime_error("Failed to acquire swapchain image (" + std::string(string_VkResult(result)) + ")!");
 			}
+#endif
 		}
 
 		//call render function:
